@@ -47,9 +47,11 @@ jobs:
 | Message | Meaning |
 | --- | --- |
 | `no tower binding for <repo>@<ref>` | tower has no enabled binding for this repo and branch (HTTP 403). Add one, or check that the binding is enabled. |
+| `could not get an OIDC token from GitHub (check permissions: id-token: write)` | GitHub's token endpoint failed four times in a row (it is retried), or the job lacks `permissions: id-token: write`. |
 | `tower rejected the OIDC token (invalid, expired or replayed)` | HTTP 401. The token failed verification. Re-run the job; check `id-token: write` and the `OIDC_AUDIENCE` setting on tower. |
 | `tower is busy, giving up` | Coolify's queue was full (HTTP 503) on three attempts. Re-run later. |
 | `timed out waiting for deploy (last status: ...)` | The deploy did not reach a final status within `timeout-minutes`. It may still finish; check the dashboard. |
+| `tower has no record of deploy <id> (did tower restart without persistent /data?)` | The poll answered HTTP 404 three times in a row. tower lost its database, usually because `/data` is not a persistent volume. Mount a volume on `/data` in Coolify and re-run. |
 | `deploy ended as <status>` | The deploy finished but not as `success` (for example `failed` or `cancelled`). |
 | `tower deploy request failed (HTTP <code>)` | Any other response, or tower could not be reached. Check `url`. |
 | `tower returned an unexpected response` | The reply was not a deploy ticket. Check that `url` points at tower. |

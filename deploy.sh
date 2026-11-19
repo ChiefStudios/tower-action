@@ -12,8 +12,16 @@ RUN_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions
 if [ -n "${GITHUB_OIDC_TOKEN:-}" ]; then
   JWT="$GITHUB_OIDC_TOKEN"
 else
-  JWT=$(curl -fsS -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?need permissions: id-token: write}" \
-    "${ACTIONS_ID_TOKEN_REQUEST_URL:?need permissions: id-token: write}&audience=tower" | jq -r .value)
+  : "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?need permissions: id-token: write}" "${ACTIONS_ID_TOKEN_REQUEST_URL:?need permissions: id-token: write}"
+  # GitHub's token endpoint sometimes answers 5xx for a moment: retry a few times before failing the job
+  JWT=""
+  for attempt in 1 2 3 4; do
+    if JWT=$(curl -fsS -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+      "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=tower" | jq -r '.value // empty') && [ -n "$JWT" ]; then break; fi
+    JWT=""
+    [ "$attempt" -lt 4 ] && sleep "${TOWER_OIDC_RETRY_SLEEP:-5}"
+  done
+  [ -n "$JWT" ] || { echo "::error::could not get an OIDC token from GitHub (check permissions: id-token: write)"; exit 1; }
 fi
 echo "::add-mask::$JWT"
 
@@ -43,14 +51,24 @@ echo "Deploy $DEPLOY_ID queued"
 
 # 3. poll
 DEADLINE=$(( $(date +%s) + TIMEOUT_MIN * 60 ))
-STATUS=queued; SITE=""
+STATUS=queued; SITE=""; APPS=""
+NOTFOUND=0; PBODY=$(mktemp)
 while :; do
-  R=$(curl -sS -H "Authorization: Bearer $POLL_TOKEN" "$POLL_URL" || echo '{}')
-  # a non-JSON response (for example a proxy 502 while tower restarts) is "no update"
-  if echo "$R" | jq -e . >/dev/null 2>&1; then
-    S=$(echo "$R" | jq -r '.status // empty' 2>/dev/null || true); [ -n "$S" ] && STATUS="$S"
-    SITE=$(echo "$R" | jq -r '.site_url // empty' 2>/dev/null || true)
-    [ "$(echo "$R" | jq -r '.terminal // false' 2>/dev/null || true)" = "true" ] && break
+  PCODE=$(curl -sS -o "$PBODY" -w '%{http_code}' -H "Authorization: Bearer $POLL_TOKEN" "$POLL_URL") || PCODE=000
+  R=$(cat "$PBODY" 2>/dev/null || echo '{}')
+  # three 404s in a row: tower never heard of this deploy (restarted without a persistent /data)
+  if [ "$PCODE" = "404" ]; then
+    NOTFOUND=$((NOTFOUND + 1))
+    if [ "$NOTFOUND" -ge 3 ]; then echo "::error::tower has no record of deploy $DEPLOY_ID (did tower restart without persistent /data?)"; exit 1; fi
+  else
+    NOTFOUND=0
+    # a non-JSON response (for example a proxy 502 while tower restarts) is "no update"
+    if echo "$R" | jq -e . >/dev/null 2>&1; then
+      S=$(echo "$R" | jq -r '.status // empty' 2>/dev/null || true); [ -n "$S" ] && STATUS="$S"
+      SITE=$(echo "$R" | jq -r '.site_url // empty' 2>/dev/null || true)
+      APPS=$(echo "$R" | jq -r '.deploys[]? | "  \(.app): \(.status)"' 2>/dev/null || true)
+      [ "$(echo "$R" | jq -r '.terminal // false' 2>/dev/null || true)" = "true" ] && break
+    fi
   fi
   if [ "$(date +%s)" -ge "$DEADLINE" ]; then echo "::error::timed out waiting for deploy (last status: $STATUS)"; exit 1; fi
   sleep "$POLL_INTERVAL"
@@ -58,6 +76,8 @@ done
 
 # 4. summary
 LINE="tower deploy $DEPLOY_ID: $STATUS${SITE:+ — $SITE}"
+if [ -n "$APPS" ]; then LINE="$LINE
+$APPS"; fi
 echo "$LINE"
 [ -n "${GITHUB_STEP_SUMMARY:-}" ] && echo "$LINE" >> "$GITHUB_STEP_SUMMARY"
 [ "$STATUS" = "success" ] || { echo "::error::deploy ended as $STATUS"; exit 1; }
